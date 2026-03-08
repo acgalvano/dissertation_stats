@@ -1,4 +1,4 @@
-# Statiscal methods for sociophonetic data
+# Statistical methods for sociophonetic data
 This repo contains the code used for the statistical analyses in _Ch. 2: Sociophonetics of sexuality \& gender in the production of Bay Area English_ and _Ch. 3: Listener gender-sexuality judgments across voice quality differences_ of the author's dissertation, including:
 * a linear mixed effects regression, done in R, for acoustic outcomes from speech production data
 * two random forests, done in Python, for perceptual judgmental label outcomes from speech perception data
