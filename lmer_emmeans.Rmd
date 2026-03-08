@@ -1,0 +1,2371 @@
+---
+title: 'Galvano: dissertation Ch. 2 stats'
+output: html_document
+date: "2026-03-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# --- core data / tidy tools ---
+library(tidyverse)   # includes dplyr, readr, tidyr, tibble, ggplot2, etc.
+
+# --- mixed models ---
+library(lme4)
+library(lmerTest)
+
+# --- post-hoc / inference ---
+library(emmeans)
+library(pbkrtest)
+
+# --- model effects / R² ---
+library(effects)
+library(MuMIn)
+library(performance)
+```
+
+# Load in datasets
+```{r wd1}
+# moments data
+all_data <- read_csv("moments_FULL_REVISION_all_w-demog_CLEAN_02-01-26.csv")
+all_data <- all_data %>%
+  rename(
+    word = words,
+  )
+all_data
+sum(is.na(all_data$COG))
+
+MPA <- read_csv("MPA_FULL_REVISION_all_w-demog_CLEAN_02-01-26.csv")
+MPA <- MPA %>%
+  rename(
+    word = words,
+  )
+MPA
+sum(is.na(MPA$Fm))
+
+norm_formants <- read_csv("formants_FULL_REVISION_NORMED_CLEAN_all_w-demog_02-02-26.csv")
+norm_formants <- norm_formants %>%
+  rename(
+    word = words,
+  )
+norm_formants <- norm_formants %>%
+  rename(
+    F1_norm = `F*1`,
+    F2_norm = `F*2`,
+    F3_norm = `F*3`,
+    segment = phones_short
+  )
+length(unique(norm_formants$speaker))
+```
+
+# Set up stepwise model selection
+```{r stepwise}
+# -------------------------
+# helpers used by stepwise + rank-fix
+# -------------------------
+capture_fit <- function(expr) {
+  msgs  <- character()
+  warns <- character()
+
+  val <- withCallingHandlers(
+    expr,
+    message = function(m) { msgs  <<- c(msgs,  conditionMessage(m)); invokeRestart("muffleMessage") },
+    warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") }
+  )
+
+  list(value = val, messages = msgs, warnings = warns)
+}
+
+fit_with_logs <- function(mod, new_form) {
+  res <- capture_fit(tryCatch(update(mod, new_form), error = function(e) e))
+  list(fit = res$value, messages = res$messages, warnings = res$warnings)
+}
+
+rank_diag <- function(mod) {
+  mf <- model.frame(mod)
+  ff <- lme4::nobars(formula(mod))
+  X  <- model.matrix(ff, data = mf)
+
+  qrX <- qr(X)
+  dropped_n <- ncol(X) - qrX$rank
+
+  if (dropped_n <= 0) {
+    return(list(dropped_n = 0L, dropped_cols = character(0), aliased = NULL))
+  }
+
+  keep_idx <- qrX$pivot[seq_len(qrX$rank)]
+  dropped_cols <- colnames(X)[setdiff(seq_len(ncol(X)), keep_idx)]
+
+  ali <- tryCatch(
+    alias(stats::lm.fit(X, rep(0, nrow(X))))$Complete,
+    error = function(e) NULL
+  )
+
+  list(dropped_n = dropped_n, dropped_cols = dropped_cols, aliased = ali)
+}
+
+print_rank_diag <- function(diag, indent = "  ") {
+  if (is.null(diag) || diag$dropped_n == 0L) return(invisible(NULL))
+
+  cat(indent, "Rank deficiency:", diag$dropped_n, "column(s) would be dropped\n", sep = "")
+  if (length(diag$dropped_cols)) {
+    cat(indent, "Dropped design-matrix columns:\n", sep = "")
+    cat(paste0(indent, indent, "- ", diag$dropped_cols), sep = "\n")
+    cat("\n")
+  }
+  if (!is.null(diag$aliased)) {
+    cat(indent, "Aliasing (why):\n", sep = "")
+    print(diag$aliased)
+  }
+  invisible(NULL)
+}
+
+violates_hierarchy <- function(all_terms, dropped) {
+  kept <- setdiff(all_terms, dropped)
+  inter <- kept[grepl(":", kept, fixed = TRUE)]
+  if (!length(inter)) return(FALSE)
+
+  dropped_set <- unique(dropped)
+  for (it in inter) {
+    parts <- strsplit(it, ":", fixed = TRUE)[[1]]
+    if (any(parts %in% dropped_set)) return(TRUE)
+  }
+  FALSE
+}
+
+# -------------------------
+# STEPWISE BEST-SUBSET (prints all candidates)
+# -------------------------
+stepwise_lmer_best_subset_print_all <- function(
+  model,
+  keep_terms = character(0),
+  criterion = c("AIC", "BIC"),
+  verbose = TRUE,
+  max_steps = 50,
+  max_drop_size = Inf,
+  enforce_hierarchy = TRUE
+) {
+  criterion <- match.arg(criterion)
+
+  current <- model
+  current_score <- if (criterion == "AIC") AIC(current) else BIC(current)
+
+  hist <- list()
+  step <- 1
+
+  if (verbose) {
+    cat("\nSTART:", criterion, "=", round(current_score, 3), "\n")
+    cat("Keeping (never drop):", if (length(keep_terms)) paste(keep_terms, collapse = ", ") else "none", "\n")
+    cat("Current formula:\n"); print(formula(current))
+
+    diag0 <- rank_diag(current)
+    if (diag0$dropped_n > 0) {
+      cat("Current model rank-diagnostics:\n")
+      print_rank_diag(diag0, indent = "  ")
+      cat("\n")
+    }
+  }
+
+  repeat {
+    if (step > max_steps) {
+      if (verbose) cat("\nReached max_steps. Stopping.\n")
+      break
+    }
+
+    all_terms <- attr(terms(lme4::nobars(formula(current))), "term.labels")
+    droppable <- setdiff(all_terms, keep_terms)
+
+    if (!length(droppable)) {
+      if (verbose) cat("\nNo eligible terms to drop. Stopping.\n")
+      break
+    }
+
+    max_k <- min(length(droppable), max_drop_size)
+
+    if (verbose) {
+      cat("\n==============================\n")
+      cat("STEP", step, "\n")
+      cat("==============================\n")
+      cat("Current", criterion, "=", round(current_score, 3), "\n")
+      cat("Eligible droppable terms (k up to", max_k, "):\n  - ",
+          paste(droppable, collapse = "\n  - "), "\n", sep = "")
+    }
+
+    best_drop  <- character(0)
+    best_score <- current_score
+    best_fit   <- NULL
+    best_msgs  <- character()
+    best_warns <- character()
+    best_diag  <- NULL
+
+    cand_table <- list()
+    cand_i <- 0L
+
+    for (k in 1:max_k) {
+      combos <- combn(droppable, k, simplify = FALSE)
+
+      if (verbose) cat("\n-- Testing drops of size k =", k, " (", length(combos), " candidates) --\n", sep = "")
+
+      for (cs in combos) {
+        if (enforce_hierarchy && violates_hierarchy(all_terms, cs)) {
+          if (verbose) {
+            cat("\n--- Candidate drop:", paste(cs, collapse = ", "), "\n")
+            cat("SKIP (hierarchy violation)\n")
+          }
+          next
+        }
+
+        upd <- paste(". ~ .", paste(sprintf("- `%s`", cs), collapse = " "))
+        new_form <- update(formula(current), as.formula(upd))
+
+        res <- fit_with_logs(current, new_form)
+        ok <- inherits(res$fit, "merMod")
+        sc <- if (ok) (if (criterion == "AIC") AIC(res$fit) else BIC(res$fit)) else NA_real_
+        diag <- if (ok) rank_diag(res$fit) else NULL
+
+        cand_i <- cand_i + 1L
+        cand_table[[cand_i]] <- data.frame(
+          step = step,
+          n_drop = k,
+          dropped = paste(cs, collapse = ", "),
+          score = sc,
+          ok = ok,
+          stringsAsFactors = FALSE
+        )
+
+        if (verbose) {
+          cat("\n--- Candidate drop:", paste(cs, collapse = ", "), "\n")
+          cat("Formula:", deparse(new_form), "\n")
+          if (!ok) {
+            cat("FIT ERROR (skipped)\n")
+          } else {
+            cat(criterion, "=", round(sc, 3), "\n")
+            print_rank_diag(diag, indent = "  ")
+          }
+          if (length(res$messages)) { cat("Messages:\n"); cat(paste0("  - ", res$messages), sep = "\n"); cat("\n") }
+          if (length(res$warnings)) { cat("Warnings:\n"); cat(paste0("  - ", res$warnings), sep = "\n"); cat("\n") }
+        }
+
+        if (ok && is.finite(sc) && sc < best_score - 1e-8) {
+          best_score <- sc
+          best_drop  <- cs
+          best_fit   <- res$fit
+          best_msgs  <- res$messages
+          best_warns <- res$warnings
+          best_diag  <- diag
+        }
+      }
+    }
+
+    cand_df <- if (length(cand_table)) do.call(rbind, cand_table) else NULL
+    if (!is.null(cand_df)) cand_df <- cand_df[order(cand_df$score), ]
+
+    if (is.null(best_fit)) {
+      if (verbose) cat("\nNo candidate improved", criterion, ". Stopping.\n")
+      break
+    }
+
+    if (verbose) {
+      cat("\n*** CHOSEN (best improving", criterion, ") ***\n")
+      cat("Best drop set:", paste(best_drop, collapse = ", "), "\n")
+      cat(criterion, "=", round(best_score, 3), "\n")
+      cat("New formula:\n"); cat(deparse(formula(best_fit)), "\n")
+      if (!is.null(best_diag) && best_diag$dropped_n > 0) {
+        cat("Rank-diagnostics for CHOSEN model:\n")
+        print_rank_diag(best_diag, indent = "  ")
+        cat("\n")
+      }
+    }
+
+    hist[[step]] <- list(
+      step = step,
+      dropped = best_drop,
+      score = best_score,
+      formula = deparse(formula(best_fit)),
+      rank_dropped_n = if (!is.null(best_diag)) best_diag$dropped_n else NA_integer_,
+      rank_dropped_cols = if (!is.null(best_diag)) best_diag$dropped_cols else character(0),
+      rank_alias = if (!is.null(best_diag)) best_diag$aliased else NULL,
+      messages = best_msgs,
+      warnings = best_warns,
+      candidates = cand_df
+    )
+
+    current <- best_fit
+    current_score <- best_score
+    step <- step + 1
+  }
+
+  attr(current, "stepwise_history") <- hist
+  current
+}
+
+# -------------------------
+# OPTIONAL (but you used it): minimal rank-fix after stepwise
+# -------------------------
+is_full_rank <- function(mod) {
+  fe <- lme4::fixef(mod)
+  !anyNA(fe)
+}
+
+minimal_rank_fix_after_stepwise <- function(
+  model,
+  keep_terms = character(0),
+  max_k = 4,
+  verbose = TRUE
+) {
+  if (is_full_rank(model)) {
+    if (verbose) cat("\nModel is already full rank. No constraint fixes needed.\n")
+    return(model)
+  }
+
+  all_terms <- attr(terms(lme4::nobars(formula(model))), "term.labels")
+  terms <- setdiff(all_terms, keep_terms)
+
+  if (verbose) {
+    cat("\nConstraint stage: starting model is rank deficient.\n")
+    cat("Eligible additional drop terms:\n")
+    print(terms)
+    cat("Starting formula:\n"); print(formula(model))
+  }
+
+  tested_all <- list()
+
+  for (k in 1:min(max_k, length(terms))) {
+    if (verbose) {
+      cat("\n====================================\n")
+      cat("CONSTRAINT SEARCH: additional drops of size k =", k, "\n")
+      cat("====================================\n")
+    }
+
+    combos <- combn(terms, k, simplify = FALSE)
+    hits <- list()
+
+    for (cs in combos) {
+      new_form <- update(formula(model),
+                         paste(". ~ . -", paste(cs, collapse = " - ")))
+
+      res <- fit_with_logs(model, new_form)
+      ok <- inherits(res$fit, "merMod")
+
+      if (verbose) {
+        cat("\n--- Candidate additional drops:", paste(cs, collapse = ", "), "\n")
+        cat("Formula:", deparse(new_form), "\n")
+      }
+
+      if (!ok) {
+        if (verbose) cat("FIT ERROR (skipped)\n")
+        next
+      }
+
+      fr <- is_full_rank(res$fit)
+      aic <- AIC(res$fit)
+
+      if (verbose) cat("AIC:", round(aic, 3), "| Full rank:", fr, "\n")
+
+      rec <- list(
+        dropped = cs,
+        AIC = aic,
+        full_rank = fr,
+        formula = deparse(formula(res$fit)),
+        model = res$fit
+      )
+      tested_all[[length(tested_all) + 1]] <- rec
+      if (fr) hits[[length(hits) + 1]] <- rec
+    }
+
+    if (length(hits)) {
+      best <- hits[[which.min(vapply(hits, `[[`, numeric(1), "AIC"))]]
+      if (verbose) {
+        cat("\n*** CHOSEN FULL-RANK MODEL (minimal k =", k, ") ***\n")
+        cat("Additional drops:", paste(best$dropped, collapse = ", "), "\n")
+        cat("AIC:", round(best$AIC, 3), "\n")
+        cat("Final formula:\n"); cat(best$formula, "\n")
+      }
+      attr(best$model, "rankfix_candidates") <- hits
+      attr(best$model, "rankfix_tested_all") <- tested_all
+      return(best$model)
+    }
+  }
+
+  stop("No full-rank model found with up to k = ", max_k, " additional drops.")
+}
+```
+
+# Select models
+## COG
+```{r finmodcog}
+exclude_speakers <- c("S18", "S44", "S09", "S10")
+
+all_data_clean <- all_data %>%
+  filter(!speaker %in% exclude_speakers)
+
+length(unique(all_data_clean$speaker))
+
+
+# ----------------------------
+# 0) Helper: sum-code factors
+# ----------------------------
+sum_code <- function(df, cols) {
+  for (nm in cols) {
+    df[[nm]] <- droplevels(factor(df[[nm]]))
+    contrasts(df[[nm]]) <- contr.sum(nlevels(df[[nm]]))
+  }
+  df
+}
+
+# ----------------------------
+# 1) Build modeling dataset
+# ----------------------------
+make_md_cc <- function(all_data_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(all_data_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(all_data_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(all_data_clean$gender_normative), na.rm = TRUE)
+
+  md <- all_data_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      COG,
+      logCOG = log(COG),
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # rows required for modeling
+  vars_needed <- c(
+    "logCOG","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc <- make_md_cc(all_data_clean)
+
+length(unique(md_cc$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod1_full <- lmer(
+  logCOG ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc,
+  REML = FALSE
+)
+
+mod1_final <- stepwise_lmer_best_subset_print_all(
+  mod1_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod1_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod2_full <- lmer(
+  logCOG ~ segment + prev_POA + nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc,
+  REML = FALSE
+)
+
+mod_step <- stepwise_lmer_best_subset_print_all(
+  mod2_full,
+  keep_terms = c("segment","prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step)
+saveRDS(mod_step, "mod_step_COG_all.rds") 
+
+mod_step <- readRDS("mod_step_COG_all.rds") 
+mod_step
+r2_nakagawa(mod_step)
+
+
+### /s/-only ###
+md_cc_s <- md_cc[md_cc$segment == "S", ]
+length(unique(md_cc_s$speaker))
+
+mod1_full1 <- lmer(
+  logCOG ~ prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc_s,
+  REML = FALSE
+)
+
+mod1_final1 <- stepwise_lmer_best_subset_print_all(
+  mod1_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod1_final1)
+
+
+mod_cog_s <- lmer(logCOG ~ prev_POA + nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc_s,
+  REML = FALSE
+)
+
+mod_step_s <- stepwise_lmer_best_subset_print_all(
+  mod_cog_s,
+  keep_terms = c("prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s)
+saveRDS(mod_step_s, "mod_step_COG_s.rds") 
+
+mod_step_s <- readRDS("mod_step_COG_s.rds") 
+mod_step_s
+r2_nakagawa(mod_step_s)
+```
+
+## SD
+```{r finmodsd}
+length(unique(all_data_clean$speaker))
+
+# ----------------------------
+# 1) Build modeling dataset
+# ----------------------------
+make_md_cc1 <- function(all_data_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(all_data_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(all_data_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(all_data_clean$gender_normative), na.rm = TRUE)
+
+  md <- all_data_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      SD,
+      logSD = log(SD),
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # rows required for modeling
+  vars_needed <- c(
+    "logSD","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc1 <- make_md_cc1(all_data_clean)
+
+length(unique(md_cc1$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod3_full <- lmer(
+  logSD ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc1,
+  REML = FALSE
+)
+
+mod3_final <- stepwise_lmer_best_subset_print_all(
+  mod3_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod3_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod4_full <- lmer(
+  logSD ~ segment + prev_POA + z_dur +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut +
+    place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc1,
+  REML = FALSE
+)
+anova(mod4_full)
+
+mod_step1 <- stepwise_lmer_best_subset_print_all(
+  mod4_full,
+  keep_terms = c("segment","prev_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step1)
+saveRDS(mod_step1, "mod_step_SD_all.rds") 
+
+mod_step1 <- readRDS("mod_step_SD_all.rds") 
+mod_step1
+r2_nakagawa(mod_step1)
+
+
+### /s/-only ###
+md_cc1_s <- md_cc1[md_cc1$segment == "S", ]
+length(unique(md_cc1_s$speaker))
+
+mod2_full1 <- lmer(
+  logSD ~ prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc1_s,
+  REML = FALSE
+)
+
+mod2_final1 <- stepwise_lmer_best_subset_print_all(
+  mod2_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod2_final1)
+
+
+mod_sd_s <- lmer(logSD ~ prev_POA + z_dur +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc1_s,
+  REML = FALSE
+)
+
+mod_step_s1 <- stepwise_lmer_best_subset_print_all(
+  mod_sd_s,
+  keep_terms = c("prev_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s1)
+saveRDS(mod_step_s1, "mod_step_SD_s.rds") 
+
+mod_step_s1 <- readRDS("mod_step_SD_s.rds") 
+mod_step_s1
+r2_nakagawa(mod_step_s1)
+```
+
+## skew
+
+```{r finmodskew}
+make_md_cc2 <- function(all_data_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(all_data_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(all_data_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(all_data_clean$gender_normative), na.rm = TRUE)
+
+  md <- all_data_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      skew,
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # must-have vars for modeling
+  vars_needed <- c(
+    "skew","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc2 <- make_md_cc2(all_data_clean)
+
+length(unique(md_cc1$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod4_full <- lmer(
+  skew ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc2,
+  REML = FALSE
+)
+
+mod4_final <- stepwise_lmer_best_subset_print_all(
+  mod4_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod4_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod4_full1 <- lmer(
+  skew ~ segment + prev_POA + nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut +
+    place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc2,
+  REML = FALSE
+)
+anova(mod4_full1)
+
+mod_step2 <- stepwise_lmer_best_subset_print_all(
+  mod4_full1,
+  keep_terms = c("segment","prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step2)
+saveRDS(mod_step2, "mod_step_skew_all.rds") 
+r2_nakagawa(mod_step2)
+
+
+### /s/-only ###
+md_cc2_s <- md_cc2[md_cc2$segment == "S", ]
+length(unique(md_cc2_s$speaker))
+
+mod3_full1 <- lmer(
+  skew ~ prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc2_s,
+  REML = FALSE
+)
+
+mod3_final1 <- stepwise_lmer_best_subset_print_all(
+  mod3_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod3_final1)
+
+
+mod_skew_s <- lmer(skew ~ prev_POA + z_dur +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc2_s,
+  REML = FALSE
+)
+
+mod_step_s2 <- stepwise_lmer_best_subset_print_all(
+  mod_skew_s,
+  keep_terms = c("prev_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s2)
+saveRDS(mod_step_s2, "mod_step_skew_s.rds") 
+
+mod_step_s2 <- readRDS("mod_step_skew_s.rds") 
+mod_step_s2
+r2_nakagawa(mod_step_s2)
+```
+
+## duration
+
+```{r finmoddur}
+make_md_cc3 <- function(all_data_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(all_data_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(all_data_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(all_data_clean$gender_normative), na.rm = TRUE)
+
+  md <- all_data_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      duration,
+      logdur = log(duration),
+      
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_logdur = as.numeric(scale(logdur)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # must-have vars for modeling
+  vars_needed <- c(
+    "z_logdur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc3 <- make_md_cc3(all_data_clean)
+
+length(unique(md_cc3$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod4_full <- lmer(
+  z_logdur ~ segment + prev_POA + nxt_POA +
+    (1 | word) + (1 | speaker),
+  data = md_cc3,
+  REML = FALSE
+)
+
+mod4_final <- stepwise_lmer_best_subset_print_all(
+  mod4_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod4_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod5_full <- lmer(
+  z_logdur ~ segment + prev_POA + nxt_POA +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut +
+    place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc3,
+  REML = FALSE
+)
+anova(mod5_full)
+
+mod_step3 <- stepwise_lmer_best_subset_print_all(
+  mod5_full,
+  keep_terms = c("segment","prev_POA","nxt_POA"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+mod_step3
+anova(mod_step3)
+saveRDS(mod_step3, "mod_step_dur_all.rds")
+r2_nakagawa(mod_step3)
+
+
+### /s/-only ###
+md_cc3_s <- md_cc3[md_cc3$segment == "S", ]
+length(unique(md_cc3_s$speaker))
+
+mod4_full1 <- lmer(
+   z_logdur ~ prev_POA + nxt_POA + 
+    (1 | word) + (1 | speaker),
+  data = md_cc3_s,
+  REML = FALSE
+)
+
+mod4_final1 <- stepwise_lmer_best_subset_print_all(
+  mod4_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod4_final1)
+
+
+mod_dur_s <- lmer(z_logdur ~ prev_POA + nxt_POA +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc3_s,
+  REML = FALSE
+)
+
+mod_step_s3 <- stepwise_lmer_best_subset_print_all(
+  mod_dur_s,
+  keep_terms = c("prev_POA","nxt_POA"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s3)
+saveRDS(mod_step_s3, "mod_step_dur_s.rds")
+
+mod_step_s2 <- readRDS("mod_step_dur_s.rds") 
+mod_step_s2
+r2_nakagawa(mod_step_s2)
+```
+
+## Fm
+
+```{r finmodfm}
+exclude_speakers <- c("S18", "S44", "S09", "S10")
+
+MPA_clean <- MPA %>%
+  filter(!speaker %in% exclude_speakers)
+
+length(unique(MPA_clean$speaker))
+
+# ----------------------------
+# 1) Build modeling dataset
+# ----------------------------
+make_md_cc4 <- function(MPA_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(MPA_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(MPA_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(MPA_clean$gender_normative), na.rm = TRUE)
+
+  md <- MPA_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      Fm,
+      logFm = log(Fm),
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # rows required for modeling
+  vars_needed <- c(
+    "logFm","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc4 <- make_md_cc4(MPA_clean)
+
+length(unique(md_cc4$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod6_full <- lmer(
+  logFm ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc4,
+  REML = FALSE
+)
+
+mod6_final <- stepwise_lmer_best_subset_print_all(
+  mod6_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod6_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod7_full <- lmer(
+  logFm ~ segment + prev_POA + nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut +
+    place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc4,
+  REML = FALSE
+)
+
+mod_step4 <- stepwise_lmer_best_subset_print_all(
+  mod7_full,
+  keep_terms = c("segment","prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+mod_step4
+anova(mod_step4)
+saveRDS(mod_step4, "mod_step_Fm_all.rds") 
+r2_nakagawa(mod_step4)
+
+
+### /s/-only ###
+md_cc4_s <- md_cc4[md_cc4$segment == "S", ]
+length(unique(md_cc4_s$speaker))
+
+mod6_full1 <- lmer(
+  logFm ~ prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc4_s,
+  REML = FALSE
+)
+
+mod6_final1 <- stepwise_lmer_best_subset_print_all(
+  mod6_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod6_final1)
+
+
+mod_fm_s <- lmer(logFm ~ prev_POA + nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc4_s,
+  REML = FALSE
+)
+
+mod_step_s4 <- stepwise_lmer_best_subset_print_all(
+  mod_fm_s,
+  keep_terms = c("prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s4)
+saveRDS(mod_step_s4, "mod_step_fm_s.rds") 
+
+mod_step_s4 <- readRDS("mod_step_fm_s.rds") 
+mod_step_s4
+r2_nakagawa(mod_step_s4)
+```
+
+## Am
+
+```{r finmodam}
+# ----------------------------
+# 1) Build modeling dataset
+# ----------------------------
+make_md_cc5 <- function(MPA_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(MPA_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(MPA_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(MPA_clean$gender_normative), na.rm = TRUE)
+
+  md <- MPA_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      Am,
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+      z_Am = as.numeric(scale(Am)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # rows required for modeling
+  vars_needed <- c(
+    "z_Am","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc5 <- make_md_cc5(MPA_clean)
+
+length(unique(md_cc5$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod7_full <- lmer(
+  z_Am ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc5,
+  REML = FALSE
+)
+
+mod7_final <- stepwise_lmer_best_subset_print_all(
+  mod7_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod7_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+mod8_full <- lmer(
+  z_Am ~ segment + z_dur +
+    task + z_masc + z_femme + z_gn + segment * sexuality_gender_cut +
+    race_ethn_cut + L1s_cut +
+    place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc5,
+  REML = FALSE
+)
+
+mod_step5 <- stepwise_lmer_best_subset_print_all(
+  mod8_full,
+  keep_terms = c("segment","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+mod_step5
+anova(mod_step5)
+saveRDS(mod_step5, "mod_step_Am_all.rds") 
+r2_nakagawa(mod_step5)
+
+
+### /s/-only ###
+md_cc5_s <- md_cc5[md_cc5$segment == "S", ]
+length(unique(md_cc5_s$speaker))
+
+mod12_full1 <- lmer(
+  z_Am ~ prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc5_s,
+  REML = FALSE
+)
+
+mod12_final1 <- stepwise_lmer_best_subset_print_all(
+  mod12_full1,
+  keep_terms = character(0),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod12_final1)
+
+
+mod_am_s <- lmer(z_Am ~ nxt_POA + z_dur +
+    task + z_masc + z_femme + z_gn + sexuality_gender_cut +
+    race_ethn_cut + L1s_cut + place_origin_cut + socio_econ_cut + 
+    (1 | word) + (1 | speaker),
+  data = md_cc5_s,
+  REML = FALSE
+)
+
+mod_step_s5 <- stepwise_lmer_best_subset_print_all(
+  mod_am_s,
+  keep_terms = c("prev_POA","nxt_POA","z_dur"),
+  criterion = "AIC",
+  max_steps = 50,
+  max_drop_size = 4,          # IMPORTANT: set a cap unless droppable terms are small
+  enforce_hierarchy = TRUE
+)
+
+anova(mod_step_s5)
+saveRDS(mod_step_s5, "mod_step_am_s.rds") 
+
+mod_step_s5 <- readRDS("mod_step_am_s.rds") 
+mod_step_s5
+r2_nakagawa(mod_step_s5)
+
+```
+
+## F1
+
+```{r gridsearch}
+capture_fit <- function(expr) {
+  msgs  <- character()
+  warns <- character()
+  val <- withCallingHandlers(
+    expr,
+    message = function(m) { msgs  <<- c(msgs,  conditionMessage(m)); invokeRestart("muffleMessage") },
+    warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") }
+  )
+  list(value = val, messages = msgs, warnings = warns)
+}
+
+grid_search_lmer_AIC_light <- function(
+  data,
+  response,
+  keep_terms = c("segment","prev_POA","nxt_POA"),
+  optional_main = c("task","z_masc","z_femme","z_gn"),
+  interaction_terms = c("sexuality_gender_cut","race_ethn_cut","L1s_cut","place_origin_cut","socio_econ_cut"),
+  re_terms = c("(1|word)", "(1|speaker)"),
+  enforce_hierarchy = TRUE,
+  verbose = TRUE,
+  keep_best_fit = TRUE,      # keep only the best model object
+  keep_top_k = 0,            # optionally keep top K fits (0 = none)
+  gc_every = 10              # run gc() every N models
+) {
+  switches <- c(optional_main, interaction_terms)
+  int_map  <- setNames(paste0("segment:", interaction_terms), interaction_terms)
+
+  build_formula_text <- function(state_vec) {
+    terms <- unique(keep_terms)
+
+    # optional mains
+    for (v in optional_main) if (isTRUE(state_vec[[v]])) terms <- c(terms, v)
+
+    # interaction blocks (+ main effect if enforce_hierarchy)
+    for (x in interaction_terms) {
+      if (isTRUE(state_vec[[x]])) {
+        if (enforce_hierarchy) terms <- c(terms, x)
+        terms <- c(terms, int_map[[x]])
+      }
+    }
+
+    rhs <- paste(unique(terms), collapse = " + ")
+    rhs <- paste(rhs, paste(re_terms, collapse = " + "), sep = " + ")
+    paste0(response, " ~ ", rhs)
+  }
+
+  # enumerate all 2^p combinations (p = 9 => 512 models)
+  p <- length(switches)
+  grid_mat <- as.data.frame(expand.grid(rep(list(c(FALSE, TRUE)), p)))
+  names(grid_mat) <- switches
+  n <- nrow(grid_mat)
+
+  if (verbose) cat(sprintf("Grid size: %d models (%d switches)\n", n, p))
+
+  # results we store (small!)
+  res_ok     <- logical(n)
+  res_AIC    <- rep(Inf, n)
+  res_form   <- character(n)
+  res_conv   <- character(n)
+  res_error  <- character(n)
+
+  # best tracking
+  best_AIC <- Inf
+  best_fit <- NULL
+  best_formula <- NA_character_
+
+  # optionally keep top-K fits (still bounded memory)
+  top_fits <- list()
+  top_AICs <- numeric(0)
+  top_forms <- character(0)
+
+  ctrl <- lme4::lmerControl(calc.derivs = FALSE)
+
+  for (i in seq_len(n)) {
+    state_i <- as.list(grid_mat[i, , drop = FALSE])
+    ftxt <- build_formula_text(state_i)
+    res_form[i] <- ftxt
+
+    if (verbose) {
+      cat(sprintf("\n[%d/%d]\n%s\n", i, n, ftxt))
+    }
+
+    fit_res <- capture_fit(
+      tryCatch(lme4::lmer(stats::as.formula(ftxt), data = data, REML = FALSE, control = ctrl),
+               error = function(e) e)
+    )
+
+    ok <- inherits(fit_res$value, "merMod")
+    res_ok[i] <- ok
+
+    if (ok) {
+      fit <- fit_res$value
+      aic <- AIC(fit)
+      res_AIC[i] <- aic
+
+      # convergence messages if any
+      conv <- NA_character_
+      optinfo <- fit@optinfo
+      if (!is.null(optinfo$conv$lme4$messages)) {
+        conv <- paste(optinfo$conv$lme4$messages, collapse = " | ")
+      }
+      res_conv[i] <- conv
+
+      # update best (and optionally keep the best fit object)
+      if (aic + 1e-9 < best_AIC) {
+        best_AIC <- aic
+        best_formula <- ftxt
+        if (keep_best_fit) best_fit <- fit
+        if (verbose) cat(sprintf(">> NEW BEST AIC: %.3f\n", best_AIC))
+      }
+
+      # optionally maintain a bounded list of top-K fits
+      if (keep_top_k > 0) {
+        # insert
+        top_AICs <- c(top_AICs, aic)
+        top_forms <- c(top_forms, ftxt)
+        if (keep_best_fit) top_fits <- c(top_fits, list(fit)) else top_fits <- top_fits
+
+        # keep only top K by AIC
+        ord <- order(top_AICs)
+        if (length(ord) > keep_top_k) ord <- ord[seq_len(keep_top_k)]
+        top_AICs <- top_AICs[ord]
+        top_forms <- top_forms[ord]
+        if (keep_best_fit) top_fits <- top_fits[ord]
+      }
+
+      # IMPORTANT: if we are not keeping this fit, drop it immediately
+      if (!keep_best_fit && keep_top_k == 0) {
+        rm(fit)
+      }
+    } else {
+      res_error[i] <- conditionMessage(fit_res$value)
+    }
+
+    if (gc_every > 0 && (i %% gc_every == 0)) {
+      gc()
+    }
+  }
+
+  results <- cbind(
+    grid_mat,
+    data.frame(
+      ok = res_ok,
+      AIC = res_AIC,
+      formula = res_form,
+      conv = res_conv,
+      error = res_error,
+      stringsAsFactors = FALSE
+    )
+  )
+  results <- results[order(results$AIC), ]
+
+  list(
+    results = results,
+    best_AIC = best_AIC,
+    best_formula = best_formula,
+    best_model = best_fit,
+    top_AICs = if (keep_top_k > 0) top_AICs else NULL,
+    top_formulas = if (keep_top_k > 0) top_forms else NULL,
+    top_models = if (keep_top_k > 0 && keep_best_fit) top_fits else NULL
+  )
+}
+
+```
+
+```{r finmodf1}
+
+exclude_speakers <- c("S18", "S44", "S09", "S10")
+
+norm_formants_clean <- norm_formants %>%
+  filter(!speaker %in% exclude_speakers)
+
+length(unique(norm_formants_clean$speaker))
+
+# ----------------------------
+# 1) Build modeling dataset
+# ----------------------------
+make_md_cc7 <- function(norm_formants_clean) {
+
+  # global medians for the three scalar predictors
+  global_masc_med  <- median(as.numeric(norm_formants_clean$masc), na.rm = TRUE)
+  global_femme_med <- median(as.numeric(norm_formants_clean$femme), na.rm = TRUE)
+  global_gn_med    <- median(as.numeric(norm_formants_clean$gender_normative), na.rm = TRUE)
+
+  md <- norm_formants_clean %>%
+    mutate(
+      # coerce to numeric
+      masc  = as.numeric(masc),
+      femme = as.numeric(femme),
+      gender_normative = as.numeric(gender_normative),
+
+      # global-median imputation (ONLY these three)
+      masc  = if_else(is.na(masc),  global_masc_med,  masc),
+      femme = if_else(is.na(femme), global_femme_med, femme),
+      gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
+    ) %>%
+    transmute(
+      F1_norm,
+      F2_norm,
+      duration,
+
+      # linguistic
+      segment,
+      prev_POA,
+      nxt_POA,
+
+      # social (categorical)
+      task,
+      place_origin_cut,
+      L1s_cut,
+      socio_econ_cut,
+      race_ethn_cut,
+      sexuality_gender_cut,
+
+      # numeric-only predictors (imputed)
+      masc,
+      femme,
+      gender_normative,
+
+      # grouping factors
+      word,
+      speaker
+    ) %>%
+    mutate(
+      # z-score numeric-only
+      z_dur   = as.numeric(scale(duration)),
+      z_masc  = as.numeric(scale(masc)),
+      z_femme = as.numeric(scale(femme)),
+      z_gn    = as.numeric(scale(gender_normative)),
+      z_F1_norm = as.numeric(scale(F1_norm)),
+      z_F2_norm = as.numeric(scale(F2_norm)),
+
+      word    = droplevels(factor(word)),
+      speaker = droplevels(factor(speaker))
+    ) %>%
+    droplevels()
+
+  # sum-code fixed-effect factors (NOT word/speaker)
+  factor_cols <- c(
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut",
+    "race_ethn_cut","sexuality_gender_cut"
+  )
+  md <- sum_code(md, factor_cols)
+
+  # rows required for modeling
+  vars_needed <- c(
+    "z_F1_norm", "z_F2_norm","z_dur","z_masc","z_femme","z_gn",
+    "segment","prev_POA","nxt_POA","task",
+    "place_origin_cut","L1s_cut","socio_econ_cut","race_ethn_cut","sexuality_gender_cut",
+    "word","speaker"
+  )
+
+  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+}
+
+md_cc7 <- make_md_cc7(norm_formants_clean)
+
+length(unique(md_cc7$speaker))
+
+
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod13_full <- lmer(
+  z_F1_norm ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc7,
+  REML = FALSE
+)
+
+mod13_final <- stepwise_lmer_best_subset_print_all(
+  mod13_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod13_final)
+mod13_final
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+gs_F1 <- grid_search_lmer_AIC_light(
+  data = md_cc7,
+  response = "z_F1_norm",
+
+  # always-on (your base linguistic block)
+  keep_terms = c("segment", "prev_POA", "nxt_POA", "z_dur"),
+
+  # OPTIONAL mains (no interactions for these)
+  optional_main = c(
+    "task", "z_masc", "z_femme", "z_gn",
+    "race_ethn_cut", "L1s_cut", "place_origin_cut", "socio_econ_cut"
+  ),
+
+  # ONLY interaction block tested (and includes main effect if enforce_hierarchy=TRUE)
+  interaction_terms = c("sexuality_gender_cut"),
+
+  re_terms = c("(1|word)", "(1|speaker)"),
+  enforce_hierarchy = TRUE,
+  verbose = TRUE,
+  keep_best_fit = TRUE,
+  keep_top_k = 0,
+  gc_every = 10
+)
+
+head(gs_F1$results, 20)
+gs_F1$best_AIC
+gs_F1$best_formula
+gs_F1
+
+# ANOVA on the best model (only if kept)
+mod_step6 <- lmer(
+  as.formula(gs_F1$best_formula),
+  data = md_cc7,
+  REML = FALSE
+)
+
+mod_step6
+anova(mod_step6)
+saveRDS(mod_step6, "mod_step_F1_all.rds") 
+r2_nakagawa(mod_step6)
+```
+
+## F2
+```{r finmodf2}
+# ----------------------------------------
+# 3) lx-only model
+# ----------------------------------------
+mod10_full <- lmer(
+  z_F2_norm ~ segment + prev_POA + nxt_POA + z_dur +
+    (1 | word) + (1 | speaker),
+  data = md_cc7,
+  REML = FALSE
+)
+
+mod10_final <- stepwise_lmer_best_subset_print_all(
+  mod10_full,
+  keep_terms = character(0),
+  criterion = "AIC",
+  verbose = TRUE, # set TRUE if you want EVERY candidate printed
+)
+
+anova(mod10_final)
+
+# ----------------------------------------
+# 4) full model
+# ----------------------------------------
+
+gs_F2 <- grid_search_lmer_AIC_light(
+  data = md_cc7,
+  response = "z_F2_norm",
+
+  # always-on (your base linguistic block)
+  keep_terms = c("segment", "prev_POA", "nxt_POA", "z_dur"),
+
+  # OPTIONAL mains (no interactions for these)
+  optional_main = c(
+    "task", "z_masc", "z_femme", "z_gn",
+    "race_ethn_cut", "L1s_cut", "place_origin_cut", "socio_econ_cut"
+  ),
+
+  # ONLY interaction block tested (and includes main effect if enforce_hierarchy=TRUE)
+  interaction_terms = c("sexuality_gender_cut"),
+
+  re_terms = c("(1|word)", "(1|speaker)"),
+  enforce_hierarchy = TRUE,
+  verbose = TRUE,
+  keep_best_fit = TRUE,
+  keep_top_k = 0,
+  gc_every = 10
+)
+
+head(gs_F2$results, 20)
+gs_F2$best_AIC
+gs_F2$best_formula
+gs_F2
+
+# ANOVA on the best model (only if kept)
+mod_step7 <- lmer(
+  as.formula(gs_F2$best_formula),
+  data = md_cc7,
+  REML = FALSE
+)
+
+mod_step7
+anova(mod_step7)
+saveRDS(mod_step7, "mod_step_F2_all.rds") 
+r2_nakagawa(mod_step7)
+```
+
+
+# Get pairwise results
+## COG
+```{r pairwisecog}
+anova(mod_step)
+options(max.print = 1e7)
+em_cog2 <- emmeans(
+  mod_step_s,
+  pairwise ~ sexuality_gender_cut,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_cog2, "em_cog_s_sexuality_gender_main.rds")        # save object
+capture.output(summary(em_cog2),           # save readable version
+               file="em_cog_s_sexuality_gender_main.txt")
+```
+
+## SD
+```{r pairwisesd}
+mod_step1
+options(max.print = 1e7)
+em_sd3 <- emmeans(
+  mod_step1,
+  pairwise ~ task,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_sd3, "em_sd_task.rds")        # save object
+capture.output(summary(em_sd3),           # save readable version
+               file="em_sd_task.txt")
+```
+
+## skew
+```{r pairwiseskew}
+mod_step2
+options(max.print = 1e7)
+em_skew <- emmeans(
+  mod_step2,
+  pairwise ~ task,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_skew, "em_skew_task.rds")        # save object
+capture.output(summary(em_skew),           # save readable version
+               file="em_skew_task.txt")
+```
+
+## duration
+```{r pairwisedur}
+anova(mod_step3)
+options(max.print = 1e7)
+em_dur3 <- emmeans(
+  mod_step3,
+  pairwise ~ task,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_dur3, "em_dur_task.rds")        # save object
+capture.output(summary(em_dur3),           # save readable version
+               file="em_dur_task.txt")
+```
+
+## Fm
+```{r pairwisefm}
+anova(mod_step3)
+options(max.print = 1e7)
+em_Fm <- emmeans(
+  mod_step4,
+  pairwise ~ segment:sexuality_gender_cut,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_Fm, "em_Fm_sexuality_gender.rds")        # save object
+capture.output(summary(em_Fm),           # save readable version
+               file="em_Fm_sexuality_gender.txt")
+```
+
+## Am
+```{r pairwiseam}
+anova(mod_step5)
+options(max.print = 1e7)
+em_Am4 <- emmeans(
+  mod_step_s5,
+  pairwise ~ task,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_Am4, "em_Am_task_s.rds")        # save object
+capture.output(summary(em_Am4),           # save readable version
+               file="em_Am_task_s.txt")
+```
+
+## F1
+```{r pairwiseam}
+gs_F1$best_formula
+options(max.print = 1e7)
+em_f14 <- emmeans(
+  mod_step6,
+  pairwise ~ task,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 58000,
+  lmerTest.limit = 58000,
+  rg.limit = 550000
+)
+
+saveRDS(em_f14, "em_f1_task.rds")        # save object
+capture.output(summary(em_f14),           # save readable version
+               file="em_f1_task.txt")
+```
+
+## F2
+```{r pairwiseam}
+anova(mod_step5)
+options(max.print = 1e7)
+em_f2 <- emmeans(
+  mod_step7,
+  pairwise ~ segment:sexuality_gender_cut,
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 46000,
+  lmerTest.limit = 46000,
+  rg.limit = 550000
+)
+
+saveRDS(em_f2, "em_f2_sexuality_gender.rds")        # save object
+capture.output(summary(em_f2),           # save readable version
+               file="em_f2_sexuality_gender.txt")
+```
+
+# Plot trend for Likert scales
+##SD
+```{r Likert}
+# -------------------------
+# GENDER NORMATIVITY: map Likert 1:7 -> z_gn using md_cc1
+# -------------------------
+gn_mean <- mean(md_cc1$gender_normative, na.rm = TRUE)
+gn_sd   <- sd(md_cc1$gender_normative, na.rm = TRUE)
+
+likert_vals <- 1:7
+z_gn_vals   <- (likert_vals - gn_mean) / gn_sd
+
+# EMMEANS at those z values (store both z_gn + gn_raw)
+emm_gn <- emmeans(
+  mod_step1,
+  ~ z_gn,
+  at = list(z_gn = z_gn_vals),
+  lmer.df = "satterthwaite",
+  adjust="bonferroni",
+  pbkrtest.limit = 3790000,
+  lmerTest.limit = 3790000,
+  rg.limit = 3790000
+)
+
+emm_gn_df <- as.data.frame(emm_gn) %>%
+  mutate(
+    gn_raw = likert_vals,
+    z_gn   = z_gn_vals
+  )
+
+# Raw plotting data
+plot_gn_df <- md_cc1 %>%
+  mutate(
+    logSD = if ("logSD" %in% names(.)) logSD else log(SD)
+  ) %>%
+  filter(!is.na(gender_normative), !is.na(logSD))
+
+p_gn <- ggplot() +
+  geom_jitter(
+    data = plot_gn_df,
+    aes(x = gender_normative, y = logSD),
+    width = 0.15,
+    alpha = 0.2,
+    size = 1.5
+  ) +
+  geom_ribbon(
+    data = emm_gn_df,
+    aes(x = gn_raw, ymin = lower.CL, ymax = upper.CL),
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = emm_gn_df,
+    aes(x = gn_raw, y = emmean),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = emm_gn_df,
+    aes(x = gn_raw, y = emmean),
+    size = 2
+  ) +
+  scale_x_continuous(breaks = 1:7, limits = c(1, 7)) +
+  labs(
+    x = "Gender normativity (1–7 Likert)",
+    y = "log(SD)"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  filename = "gn_plot_logSD.png",
+  plot = p_gn,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+
+```
+
+## Fm
+
+```{r Likert1}
+# -------------------------
+# FEMME: map Likert 1:7 -> z_femme using md_cc7
+# -------------------------
+femme_mean <- mean(md_cc4$femme, na.rm = TRUE)
+femme_sd   <- sd(md_cc4$femme, na.rm = TRUE)
+
+likert_vals <- 1:7
+z_femme_vals <- (likert_vals - femme_mean) / femme_sd
+
+# EMMEANS at those z values
+emm_femme <- emmeans(
+  best_fit_f1,
+  ~ z_femme,
+  at = list(z_femme = z_femme_vals),
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 3790000,
+  lmerTest.limit = 3790000,
+  rg.limit = 3790000
+)
+
+emm_femme_df <- as.data.frame(emm_femme)
+emm_femme_df$femme_raw <- likert_vals
+
+# Raw plotting data (only rows with needed columns present)
+plot_femme_df <- md_cc4[!is.na(md_cc4$femme) &
+                        !is.na(md_cc4$z_F1_norm), ]
+
+p_femme <- ggplot() +
+  # raw data
+  geom_jitter(
+    data = plot_femme_df,
+    aes(x = femme, y = z_F1_norm),
+    width = 0.15,
+    alpha = 0.2,
+    size = 1.5
+  ) +
+  # CI ribbon
+  geom_ribbon(
+    data = emm_femme_df,
+    aes(x = femme_raw, ymin = lower.CL, ymax = upper.CL),
+    alpha = 0.2
+  ) +
+  # predicted line + points
+  geom_line(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    size = 2
+  ) +
+  scale_x_continuous(breaks = 1:7, limits = c(1, 7)) +
+  labs(
+    x = "Femininity (1–7 Likert)",
+    y = "scale(F1_norm)"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  filename = "femme_plot_logFm.png",
+  plot = p_femme,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+
+```
+
+## F1
+```{r Likert2}
+# -------------------------
+# FEMME: map Likert 1:7 -> z_femme using md_cc7
+# -------------------------
+femme_mean <- mean(md_cc7$femme, na.rm = TRUE)
+femme_sd   <- sd(md_cc7$femme, na.rm = TRUE)
+
+likert_vals <- 1:7
+z_femme_vals <- (likert_vals - femme_mean) / femme_sd
+
+# EMMEANS at those z values
+emm_femme <- emmeans(
+  mod_step7,
+  ~ z_femme,
+  at = list(z_femme = z_femme_vals),
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 3790000,
+  lmerTest.limit = 3790000,
+  rg.limit = 3790000
+)
+
+emm_femme_df <- as.data.frame(emm_femme)
+emm_femme_df$femme_raw <- likert_vals
+
+# Raw plotting data (only rows with needed columns present)
+plot_femme_df <- md_cc7[!is.na(md_cc7$femme) &
+                        !is.na(md_cc7$z_F1_norm), ]
+
+p_femme <- ggplot() +
+  # raw data
+  geom_jitter(
+    data = plot_femme_df,
+    aes(x = femme, y = z_F1_norm),
+    width = 0.15,
+    alpha = 0.2,
+    size = 1.5
+  ) +
+  # CI ribbon
+  geom_ribbon(
+    data = emm_femme_df,
+    aes(x = femme_raw, ymin = lower.CL, ymax = upper.CL),
+    alpha = 0.2
+  ) +
+  # predicted line + points
+  geom_line(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    size = 2
+  ) +
+  scale_x_continuous(breaks = 1:7, limits = c(1, 7)) +
+  labs(
+    x = "Femininity (1–7 Likert)",
+    y = "scale(F1_norm)"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  filename = "femme_plot_zF1norm.png",
+  plot = p_femme,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+
+```
+
+## F2
+```{r Likert2}
+# -------------------------
+# FEMME: map Likert 1:7 -> z_femme using md_cc7
+# -------------------------
+femme_mean <- mean(md_cc7$femme, na.rm = TRUE)
+femme_sd   <- sd(md_cc7$femme, na.rm = TRUE)
+
+likert_vals <- 1:7
+z_femme_vals <- (likert_vals - femme_mean) / femme_sd
+
+# EMMEANS at those z values
+emm_femme <- emmeans(
+  mod_step7,
+  ~ z_femme,
+  at = list(z_femme = z_femme_vals),
+  adjust = "bonferroni",
+  lmer.df = "satterthwaite",
+  pbkrtest.limit = 3790000,
+  lmerTest.limit = 3790000,
+  rg.limit = 3790000
+)
+
+emm_femme_df <- as.data.frame(emm_femme)
+emm_femme_df$femme_raw <- likert_vals
+
+# Raw plotting data (only rows with needed columns present)
+plot_femme_df <- md_cc7[!is.na(md_cc7$femme) &
+                        !is.na(md_cc7$z_F2_norm), ]
+
+p_femme <- ggplot() +
+  # raw data
+  geom_jitter(
+    data = plot_femme_df,
+    aes(x = femme, y = z_F2_norm),
+    width = 0.15,
+    alpha = 0.2,
+    size = 1.5
+  ) +
+  # CI ribbon
+  geom_ribbon(
+    data = emm_femme_df,
+    aes(x = femme_raw, ymin = lower.CL, ymax = upper.CL),
+    alpha = 0.2
+  ) +
+  # predicted line + points
+  geom_line(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = emm_femme_df,
+    aes(x = femme_raw, y = emmean),
+    size = 2
+  ) +
+  scale_x_continuous(breaks = 1:7, limits = c(1, 7)) +
+  labs(
+    x = "Femininity (1–7 Likert)",
+    y = "scale(F2_norm)"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  filename = "femme_plot_zF2norm.png",
+  plot = p_femme,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+
+```
+
