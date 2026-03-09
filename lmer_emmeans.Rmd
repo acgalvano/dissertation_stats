@@ -66,25 +66,60 @@ capture_fit <- function(expr) {
   msgs  <- character()
   warns <- character()
 
+  # withCallingHandlers() lets you intercept messages and warnings while
+  # continuing evaluation; invokeRestart("muffleMessage"/"muffleWarning")
+  # suppresses printing after capture.
+  # R condition handling docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/conditions.html
   val <- withCallingHandlers(
     expr,
-    message = function(m) { msgs  <<- c(msgs,  conditionMessage(m)); invokeRestart("muffleMessage") },
-    warning = function(w) { warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning") }
+    message = function(m) {
+      msgs  <<- c(msgs, conditionMessage(m))
+      invokeRestart("muffleMessage")
+    },
+    warning = function(w) {
+      warns <<- c(warns, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
   )
 
   list(value = val, messages = msgs, warnings = warns)
 }
 
 fit_with_logs <- function(mod, new_form) {
+  # tryCatch() traps errors and returns the error object here instead of
+  # stopping execution, while capture_fit() separately collects messages/warnings.
+  # R condition handling docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/conditions.html
   res <- capture_fit(tryCatch(update(mod, new_form), error = function(e) e))
   list(fit = res$value, messages = res$messages, warnings = res$warnings)
 }
 
 rank_diag <- function(mod) {
+  # model.frame() reconstructs the data used by the fitted model.
+  # model.matrix() builds the fixed-effects design matrix.
+  # R model.frame / model.matrix docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/model.frame.html
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/model.matrix.html
   mf <- model.frame(mod)
+
+  # nobars() removes random-effects terms from an lme4-style formula so that
+  # the fixed-effects design matrix can be inspected directly.
+  # lme4 package manual:
+  # https://cran.r-project.org/web/packages/lme4/lme4.pdf
+  #
+  # Note: recent package news indicates these formula helpers are being moved
+  # toward the reformulas package, so reformulas::nobars() may be the more
+  # future-proof choice in newer workflows.
+  # reformulas package:
+  # https://cran.r-project.org/web/packages/reformulas/reformulas.pdf
   ff <- lme4::nobars(formula(mod))
+
   X  <- model.matrix(ff, data = mf)
 
+  # qr() gives the QR decomposition used here to diagnose rank deficiency.
+  # R qr docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/qr.html
   qrX <- qr(X)
   dropped_n <- ncol(X) - qrX$rank
 
@@ -95,6 +130,11 @@ rank_diag <- function(mod) {
   keep_idx <- qrX$pivot[seq_len(qrX$rank)]
   dropped_cols <- colnames(X)[setdiff(seq_len(ncol(X)), keep_idx)]
 
+  # alias() identifies complete aliasing / non-estimable linear dependencies
+  # in model terms. lm.fit() is used here as a lightweight linear-model engine
+  # over the already-built design matrix.
+  # R alias docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/alias.html
   ali <- tryCatch(
     alias(stats::lm.fit(X, rep(0, nrow(X))))$Complete,
     error = function(e) NULL
@@ -126,6 +166,9 @@ violates_hierarchy <- function(all_terms, dropped) {
 
   dropped_set <- unique(dropped)
   for (it in inter) {
+    # strsplit() is used to split interaction terms like A:B into component terms.
+    # R strsplit docs:
+    # https://stat.ethz.ch/R-manual/R-devel/library/base/html/strsplit.html
     parts <- strsplit(it, ":", fixed = TRUE)[[1]]
     if (any(parts %in% dropped_set)) return(TRUE)
   }
@@ -144,9 +187,17 @@ stepwise_lmer_best_subset_print_all <- function(
   max_drop_size = Inf,
   enforce_hierarchy = TRUE
 ) {
+  # match.arg() validates the user's choice against allowed options
+  # and returns the matched value.
+  # R match.arg docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/match.arg.html
   criterion <- match.arg(criterion)
 
   current <- model
+
+  # AIC / BIC are standard information criteria for model comparison.
+  # R AIC / BIC docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/AIC.html
   current_score <- if (criterion == "AIC") AIC(current) else BIC(current)
 
   hist <- list()
@@ -157,6 +208,8 @@ stepwise_lmer_best_subset_print_all <- function(
     cat("Keeping (never drop):", if (length(keep_terms)) paste(keep_terms, collapse = ", ") else "none", "\n")
     cat("Current formula:\n"); print(formula(current))
 
+    # rank_diag() and print_rank_diag() are custom helpers defined earlier
+    # to diagnose rank deficiency / aliasing in the fixed-effects design matrix.
     diag0 <- rank_diag(current)
     if (diag0$dropped_n > 0) {
       cat("Current model rank-diagnostics:\n")
@@ -171,6 +224,13 @@ stepwise_lmer_best_subset_print_all <- function(
       break
     }
 
+    # nobars() removes random-effects terms from the mixed-effects formula,
+    # and terms(..., "term.labels") extracts the fixed-effect term labels.
+    # lme4 / reformulas formula helpers:
+    # https://cran.r-project.org/web/packages/lme4/lme4.pdf
+    # https://cran.r-project.org/web/packages/reformulas/reformulas.pdf
+    # R terms docs:
+    # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/terms.formula.html
     all_terms <- attr(terms(lme4::nobars(formula(current))), "term.labels")
     droppable <- setdiff(all_terms, keep_terms)
 
@@ -201,11 +261,16 @@ stepwise_lmer_best_subset_print_all <- function(
     cand_i <- 0L
 
     for (k in 1:max_k) {
+      # combn() generates all subsets of size k from the droppable terms.
+      # R combn docs:
+      # https://stat.ethz.ch/R-manual/R-devel/library/utils/html/combn.html
       combos <- combn(droppable, k, simplify = FALSE)
 
       if (verbose) cat("\n-- Testing drops of size k =", k, " (", length(combos), " candidates) --\n", sep = "")
 
       for (cs in combos) {
+        # violates_hierarchy() is a custom helper that prevents keeping
+        # an interaction term if one of its lower-order components is dropped.
         if (enforce_hierarchy && violates_hierarchy(all_terms, cs)) {
           if (verbose) {
             cat("\n--- Candidate drop:", paste(cs, collapse = ", "), "\n")
@@ -214,10 +279,22 @@ stepwise_lmer_best_subset_print_all <- function(
           next
         }
 
+        # Build an update formula by subtracting the candidate drop set.
+        # update.formula() applies incremental modifications to formulas.
+        # R update.formula docs:
+        # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/update.formula.html
         upd <- paste(". ~ .", paste(sprintf("- `%s`", cs), collapse = " "))
         new_form <- update(formula(current), as.formula(upd))
 
+        # fit_with_logs() is a custom helper defined earlier that:
+        #   1) updates/refits the model
+        #   2) captures messages/warnings
+        #   3) returns errors without stopping execution
         res <- fit_with_logs(current, new_form)
+
+        # lme4 mixed-model fits inherit from class "merMod"
+        # lme4 package manual:
+        # https://cran.r-project.org/web/packages/lme4/lme4.pdf
         ok <- inherits(res$fit, "merMod")
         sc <- if (ok) (if (criterion == "AIC") AIC(res$fit) else BIC(res$fit)) else NA_real_
         diag <- if (ok) rank_diag(res$fit) else NULL
@@ -241,10 +318,19 @@ stepwise_lmer_best_subset_print_all <- function(
             cat(criterion, "=", round(sc, 3), "\n")
             print_rank_diag(diag, indent = "  ")
           }
-          if (length(res$messages)) { cat("Messages:\n"); cat(paste0("  - ", res$messages), sep = "\n"); cat("\n") }
-          if (length(res$warnings)) { cat("Warnings:\n"); cat(paste0("  - ", res$warnings), sep = "\n"); cat("\n") }
+          if (length(res$messages)) {
+            cat("Messages:\n")
+            cat(paste0("  - ", res$messages), sep = "\n")
+            cat("\n")
+          }
+          if (length(res$warnings)) {
+            cat("Warnings:\n")
+            cat(paste0("  - ", res$warnings), sep = "\n")
+            cat("\n")
+          }
         }
 
+        # Keep the best strictly improving candidate under the chosen criterion.
         if (ok && is.finite(sc) && sc < best_score - 1e-8) {
           best_score <- sc
           best_drop  <- cs
@@ -276,6 +362,7 @@ stepwise_lmer_best_subset_print_all <- function(
       }
     }
 
+    # Save stepwise search history, including candidate table and rank diagnostics.
     hist[[step]] <- list(
       step = step,
       dropped = best_drop,
@@ -294,15 +381,27 @@ stepwise_lmer_best_subset_print_all <- function(
     step <- step + 1
   }
 
+  # Store the full search history as an attribute on the returned fitted model.
+  # R attributes docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/attr.html
   attr(current, "stepwise_history") <- hist
   current
 }
 
 # -------------------------
-# OPTIONAL (but you used it): minimal rank-fix after stepwise
+# OPTIONAL: minimal rank-fix after stepwise
 # -------------------------
 is_full_rank <- function(mod) {
+  # fixef() extracts the fixed-effect coefficient estimates from an lme4 model.
+  # If the design matrix is rank deficient, some coefficients are returned as NA.
+  # lme4 fixef docs:
+  # https://cran.r-project.org/web/packages/lme4/lme4.pdf
   fe <- lme4::fixef(mod)
+
+  # anyNA() checks whether any coefficient estimates are NA
+  # (a simple indicator of rank deficiency).
+  # R anyNA docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/base/html/anyNA.html
   !anyNA(fe)
 }
 
@@ -312,12 +411,24 @@ minimal_rank_fix_after_stepwise <- function(
   max_k = 4,
   verbose = TRUE
 ) {
+
+  # If the model already has a full-rank fixed-effects design matrix,
+  # return it unchanged.
   if (is_full_rank(model)) {
     if (verbose) cat("\nModel is already full rank. No constraint fixes needed.\n")
     return(model)
   }
 
+  # Extract fixed-effect term labels from the model formula
+  # (removing random-effects terms first).
+  # lme4::nobars removes random-effects terms from the formula.
+  # R terms() extracts term labels.
+  # docs:
+  # https://cran.r-project.org/web/packages/lme4/lme4.pdf
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/terms.formula.html
   all_terms <- attr(terms(lme4::nobars(formula(model))), "term.labels")
+
+  # Do not allow dropping terms that were explicitly protected.
   terms <- setdiff(all_terms, keep_terms)
 
   if (verbose) {
@@ -329,21 +440,40 @@ minimal_rank_fix_after_stepwise <- function(
 
   tested_all <- list()
 
+  # Try dropping increasingly large subsets of terms until
+  # a full-rank model is found.
   for (k in 1:min(max_k, length(terms))) {
+
     if (verbose) {
       cat("\n====================================\n")
       cat("CONSTRAINT SEARCH: additional drops of size k =", k, "\n")
       cat("====================================\n")
     }
 
+    # Generate all combinations of size k
+    # R combn docs:
+    # https://stat.ethz.ch/R-manual/R-devel/library/utils/html/combn.html
     combos <- combn(terms, k, simplify = FALSE)
+
     hits <- list()
 
     for (cs in combos) {
-      new_form <- update(formula(model),
-                         paste(". ~ . -", paste(cs, collapse = " - ")))
 
+      # Update formula by subtracting the candidate drop terms.
+      # R update.formula docs:
+      # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/update.formula.html
+      new_form <- update(
+        formula(model),
+        paste(". ~ . -", paste(cs, collapse = " - "))
+      )
+
+      # fit_with_logs() is the helper defined earlier that:
+      #  • refits the model
+      #  • captures warnings/messages
+      #  • prevents the search from stopping on errors
       res <- fit_with_logs(model, new_form)
+
+      # lme4 models inherit from class "merMod"
       ok <- inherits(res$fit, "merMod")
 
       if (verbose) {
@@ -356,7 +486,12 @@ minimal_rank_fix_after_stepwise <- function(
         next
       }
 
+      # Check if the resulting model is full rank
       fr <- is_full_rank(res$fit)
+
+      # Compute model AIC
+      # R AIC docs:
+      # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/AIC.html
       aic <- AIC(res$fit)
 
       if (verbose) cat("AIC:", round(aic, 3), "| Full rank:", fr, "\n")
@@ -368,20 +503,29 @@ minimal_rank_fix_after_stepwise <- function(
         formula = deparse(formula(res$fit)),
         model = res$fit
       )
+
       tested_all[[length(tested_all) + 1]] <- rec
       if (fr) hits[[length(hits) + 1]] <- rec
     }
 
+    # If any full-rank models were found at this subset size,
+    # choose the one with the best (lowest) AIC.
     if (length(hits)) {
+
       best <- hits[[which.min(vapply(hits, `[[`, numeric(1), "AIC"))]]
+
       if (verbose) {
         cat("\n*** CHOSEN FULL-RANK MODEL (minimal k =", k, ") ***\n")
         cat("Additional drops:", paste(best$dropped, collapse = ", "), "\n")
         cat("AIC:", round(best$AIC, 3), "\n")
         cat("Final formula:\n"); cat(best$formula, "\n")
       }
+
+      # Store search diagnostics as attributes on the returned model
+      # so the user can inspect all tested candidates later.
       attr(best$model, "rankfix_candidates") <- hits
       attr(best$model, "rankfix_tested_all") <- tested_all
+
       return(best$model)
     }
   }
@@ -405,10 +549,30 @@ length(unique(all_data_clean$speaker))
 # 0) Helper: sum-code factors
 # ----------------------------
 sum_code <- function(df, cols) {
+
+  # Apply sum (deviation) coding to selected categorical predictors.
+  # Sum coding constrains the coefficients so that category effects
+  # sum to zero, making each coefficient represent a deviation from
+  # the grand mean rather than from a reference level.
+  # R contr.sum docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/contr.sum.html
+
   for (nm in cols) {
+
+    # Ensure the column is treated as a factor and drop unused levels.
+    # droplevels() removes factor levels not present in the data.
+    # R droplevels docs:
+    # https://stat.ethz.ch/R-manual/R-devel/library/base/html/droplevels.html
     df[[nm]] <- droplevels(factor(df[[nm]]))
+
+    # Assign sum contrasts to the factor.
+    # contrasts() sets the contrast matrix used by model.matrix()
+    # when constructing the design matrix.
+    # R contrasts docs:
+    # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/contrasts.html
     contrasts(df[[nm]]) <- contr.sum(nlevels(df[[nm]]))
   }
+
   df
 }
 
@@ -417,34 +581,41 @@ sum_code <- function(df, cols) {
 # ----------------------------
 make_md_cc <- function(all_data_clean) {
 
-  # global medians for the three scalar predictors
+  # Compute global medians for three scalar predictors.
+  # median() computes the median while optionally ignoring NA values.
+  # R median docs:
+  # https://stat.ethz.ch/R-manual/R-devel/library/stats/html/median.html
   global_masc_med  <- median(as.numeric(all_data_clean$masc), na.rm = TRUE)
   global_femme_med <- median(as.numeric(all_data_clean$femme), na.rm = TRUE)
   global_gn_med    <- median(as.numeric(all_data_clean$gender_normative), na.rm = TRUE)
 
   md <- all_data_clean %>%
     mutate(
-      # coerce to numeric
+      # Ensure predictors are numeric before transformation.
       masc  = as.numeric(masc),
       femme = as.numeric(femme),
       gender_normative = as.numeric(gender_normative),
 
-      # global-median imputation (ONLY these three)
+      # Global-median imputation for missing values in these three predictors.
+      # if_else() performs vectorized conditional replacement.
+      # R if_else docs:
+      # https://dplyr.tidyverse.org/reference/if_else.html
       masc  = if_else(is.na(masc),  global_masc_med,  masc),
       femme = if_else(is.na(femme), global_femme_med, femme),
       gender_normative = if_else(is.na(gender_normative), global_gn_med, gender_normative)
     ) %>%
     transmute(
+      # Keep only variables used in modeling and create derived ones.
       COG,
-      logCOG = log(COG),
+      logCOG = log(COG),   # log transform of spectral center-of-gravity
       duration,
 
-      # linguistic
+      # Linguistic predictors
       segment,
       prev_POA,
       nxt_POA,
 
-      # social (categorical)
+      # Social categorical predictors
       task,
       place_origin_cut,
       L1s_cut,
@@ -452,28 +623,36 @@ make_md_cc <- function(all_data_clean) {
       race_ethn_cut,
       sexuality_gender_cut,
 
-      # numeric-only predictors (imputed)
+      # Numeric predictors (imputed above)
       masc,
       femme,
       gender_normative,
 
-      # grouping factors
+      # Grouping factors for mixed-effects model
       word,
       speaker
     ) %>%
     mutate(
-      # z-score numeric-only
+      # Z-score numeric predictors (mean=0, sd=1) for comparability
+      # scale() standardizes numeric vectors.
+      # R scale docs:
+      # https://stat.ethz.ch/R-manual/R-devel/library/base/html/scale.html
       z_dur   = as.numeric(scale(duration)),
       z_masc  = as.numeric(scale(masc)),
       z_femme = as.numeric(scale(femme)),
       z_gn    = as.numeric(scale(gender_normative)),
 
+      # Ensure grouping variables are factors with unused levels removed
+      # droplevels() removes factor levels not present in the data.
+      # R droplevels docs:
+      # https://stat.ethz.ch/R-manual/R-devel/library/base/html/droplevels.html
       word    = droplevels(factor(word)),
       speaker = droplevels(factor(speaker))
     ) %>%
     droplevels()
 
-  # sum-code fixed-effect factors (NOT word/speaker)
+  # Apply sum (deviation) coding to categorical fixed effects.
+  # sum_code() is the helper defined earlier that assigns contr.sum contrasts.
   factor_cols <- c(
     "segment","prev_POA","nxt_POA","task",
     "place_origin_cut","L1s_cut","socio_econ_cut",
@@ -481,7 +660,7 @@ make_md_cc <- function(all_data_clean) {
   )
   md <- sum_code(md, factor_cols)
 
-  # rows required for modeling
+  # Variables required for model fitting.
   vars_needed <- c(
     "logCOG","z_dur","z_masc","z_femme","z_gn",
     "segment","prev_POA","nxt_POA","task",
@@ -489,11 +668,21 @@ make_md_cc <- function(all_data_clean) {
     "word","speaker"
   )
 
-  md %>% tidyr::drop_na(dplyr::all_of(vars_needed)) %>% droplevels()
+  # Remove rows with missing values in required predictors.
+  # drop_na() removes rows with NA values in specified columns.
+  # tidyr drop_na docs:
+  # https://tidyr.tidyverse.org/reference/drop_na.html
+  md %>%
+    tidyr::drop_na(dplyr::all_of(vars_needed)) %>%
+    droplevels()
 }
 
+# Build modeling dataset
 md_cc <- make_md_cc(all_data_clean)
 
+# Number of unique speakers in the resulting dataset
+# unique() returns distinct values.
+# length() counts them.
 length(unique(md_cc$speaker))
 
 
@@ -2078,37 +2267,72 @@ capture.output(summary(em_f2),           # save readable version
 # -------------------------
 # GENDER NORMATIVITY: map Likert 1:7 -> z_gn using md_cc1
 # -------------------------
+# Compute the mean and SD of the original gender-normativity variable
+# so 1–7 raw Likert values can be mapped onto the z-scored scale used in the model.
+# R mean / sd docs:
+# https://stat.ethz.ch/R-manual/R-devel/library/base/html/mean.html
+# https://stat.ethz.ch/R-manual/R-devel/library/stats/html/sd.html
 gn_mean <- mean(md_cc1$gender_normative, na.rm = TRUE)
 gn_sd   <- sd(md_cc1$gender_normative, na.rm = TRUE)
 
+# Raw Likert values to display on the plot
 likert_vals <- 1:7
+
+# Convert raw Likert values to the z-score scale used by the fitted model
 z_gn_vals   <- (likert_vals - gn_mean) / gn_sd
 
-# EMMEANS at those z values (store both z_gn + gn_raw)
+# Estimated marginal means at those z-scored values.
+# emmeans computes model-based estimated marginal means (least-squares means)
+# and accepts specific covariate values via the 'at' argument.
+# emmeans docs:
+# https://rvlenth.github.io/emmeans/reference/emmeans.html
 emm_gn <- emmeans(
   mod_step1,
   ~ z_gn,
   at = list(z_gn = z_gn_vals),
   lmer.df = "satterthwaite",
-  adjust="bonferroni",
+  adjust = "bonferroni",
   pbkrtest.limit = 3790000,
   lmerTest.limit = 3790000,
   rg.limit = 3790000
 )
 
+# Convert the emmGrid result to a data frame and attach both the raw Likert
+# values and their z-scored counterparts for plotting.
+# summary / as.data.frame methods for emmGrid:
+# https://rvlenth.github.io/emmeans/reference/summary.emmGrid.html
+# dplyr mutate:
+# https://dplyr.tidyverse.org/reference/mutate.html
 emm_gn_df <- as.data.frame(emm_gn) %>%
   mutate(
     gn_raw = likert_vals,
     z_gn   = z_gn_vals
   )
 
-# Raw plotting data
+# Raw plotting data:
+# use logSD if it already exists; otherwise create it from SD.
+# dplyr mutate / filter:
+# https://dplyr.tidyverse.org/reference/mutate.html
+# https://dplyr.tidyverse.org/reference/filter.html
 plot_gn_df <- md_cc1 %>%
   mutate(
     logSD = if ("logSD" %in% names(.)) logSD else log(SD)
   ) %>%
   filter(!is.na(gender_normative), !is.na(logSD))
 
+# Build plot:
+# - jittered raw observations
+# - model-based confidence ribbon
+# - EMM line and points
+#
+# ggplot2 docs:
+# geom_jitter: https://ggplot2.tidyverse.org/reference/geom_jitter.html
+# geom_ribbon: https://ggplot2.tidyverse.org/reference/geom_ribbon.html
+# geom_line / geom_path: https://ggplot2.tidyverse.org/reference/geom_path.html
+# geom_point: https://ggplot2.tidyverse.org/reference/geom_point.html
+# scale_x_continuous: https://ggplot2.tidyverse.org/reference/scale_continuous.html
+# labs: https://ggplot2.tidyverse.org/reference/labs.html
+# theme_classic: https://ggplot2.tidyverse.org/reference/ggtheme.html
 p_gn <- ggplot() +
   geom_jitter(
     data = plot_gn_df,
@@ -2139,6 +2363,9 @@ p_gn <- ggplot() +
   ) +
   theme_classic(base_size = 14)
 
+# Save the plot to disk.
+# ggsave docs:
+# https://ggplot2.tidyverse.org/reference/ggsave.html
 ggsave(
   filename = "gn_plot_logSD.png",
   plot = p_gn,
