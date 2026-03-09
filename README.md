@@ -4,4 +4,4 @@ This repo contains the code used for the statistical analyses in _Ch. 2: Socioph
 * two random forests, done in Python, for perceptual judgmental label outcomes from speech perception data
 * a Bayesian multinomial logistic regression, done in Python, for perceptual judgmental label outcomes from speech perception data
 
-Code was written through a combination of the author's own knowledge, material from the Info 251 course on Applied Machine Learning at UC Berkeley, and vibe coding using Chat GPT 5.1-5.2 with the Plus subscription. References to documentation or previous usage are provided for processes or concepts introduced via the latter.
+Code was written through a combination of the author's own knowledge, material from the INFO 251 course on Applied Machine Learning at UC Berkeley, and vibe coding using Chat GPT 5.1-5.2 with the Plus subscription. References to documentation or previous usage are provided for processes or concepts introduced via the latter.
